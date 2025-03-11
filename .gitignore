@@ -1,3 +1,4 @@
-kvm-hello-world
+**/mini_hypervisor
 *.o
 *.img
+*.vscode
