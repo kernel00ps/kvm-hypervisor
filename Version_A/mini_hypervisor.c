@@ -228,12 +228,12 @@ int main(int argc, char *argv[])
     }
     // check argument validity
     if (memory_arg == 0 || (page_arg != 4 && page_arg != 2) || (memory_arg != 2 && memory_arg != 4 && memory_arg != 8) || guest_img_path == NULL) {
-        fprintf(stderr, "Usage: %s --memory <4|2> --page <4|2> --guest <path>\n", argv[0]);
+        fprintf(stderr, "Usage: %s --memory <8|4|2> --page <4|2> --guest <path>\n", argv[0]);
         //exit(EXIT_FAILURE);
         return 1;
     }
 
-    printf("hypervisor started: mem = %zu MB, page = %sKB\n",
+    printf("Hypervisor started: mem = %zuMB, page = %sKB\n",
            (size_t)memory_arg, (page_arg == 4) ? "4" : "2048"); 
               
     struct vm vm;
@@ -286,7 +286,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    img = fopen(guest_img_path, "r");
+    img = fopen(guest_img_path, "rb");
     if (!img) {
         printf("Can't open binary file\n");
         cleanup_vm(&vm, mem);

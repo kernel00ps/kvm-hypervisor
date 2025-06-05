@@ -204,8 +204,8 @@ void* run_vm(void *arg)
         ret = ioctl(vm->vcpu_fd, KVM_RUN, 0);
         if (ret == -1) {
             printf("KVM_RUN failed\n");
-            cleanup_vm(vm, mem); // TODO &vm->vm
-            return NULL; // 1->NULL
+            cleanup_vm(vm, mem);
+            return NULL;
         }
 
         switch (vm->kvm_run->exit_reason) {
@@ -242,7 +242,7 @@ void* run_vm(void *arg)
                 break;
         }
     }
-    cleanup_vm(vm, mem); // TODO &vm->vm
+    cleanup_vm(vm, mem);
 }
 
 int main(int argc, char *argv[])
@@ -284,7 +284,7 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
         }
     }
-    
+
     int opt_end = optind; // first index of non-option args
 
     // absorb any remaining argv[] entries as additional guest paths
@@ -297,7 +297,7 @@ int main(int argc, char *argv[])
     }
 
     if (guests_parsed == 0) {
-        fprintf(stderr, "error: at least one --guest <path> is required\n");
+        fprintf(stderr, "Error: at least one --guest <path> is required\n");
         return EXIT_FAILURE;
     }
 
@@ -306,9 +306,9 @@ int main(int argc, char *argv[])
     // check argument validity
     if (memory_arg == 0 ||
         (page_arg != 4 && page_arg != 2) ||
-        (memory_arg != 2 && memory_arg != 4) ||
+        (memory_arg != 2 && memory_arg != 4 && memory_arg != 8) ||
         num_guests < 1) {
-        fprintf(stderr, "Usage: %s --memory <4|2> --page <4|2> --guest <img1> ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s --memory <8|4|2> --page <4|2> --guest <img1> ...\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -316,14 +316,13 @@ int main(int argc, char *argv[])
     mem = memory_arg * MEM_BASE_MULTIPLIER;
     page_size = (page_arg == 4) ? PAGE_SIZE_4KB : PAGE_SIZE_2MB;
 
-    printf("hypervisor started: mem = %zu MB, page = %sKB, guests = %d\n",
+    printf("Hypervisor started: mem = %zuMB, page = %sKB, guests = %d\n",
            (size_t)memory_arg, (page_arg == 4) ? "4" : "2048", num_guests);
 
     pthread_t threads[num_guests];
 	struct vm vms[num_guests];
 	struct kvm_sregs sregs[num_guests];
 	struct kvm_regs regs[num_guests];
-	int stop = 0; // TODO Move?
 	FILE* img[num_guests];
 
     // initializing VMs and loading their guest images
@@ -367,9 +366,9 @@ int main(int argc, char *argv[])
         }
 
         // open guest img file
-        img[i] = fopen(guest_paths[i], "rb"); //TODO r vs rb
+        img[i] = fopen(guest_paths[i], "rb");
         if (img[i] == NULL) {
-            fprintf(stderr, "cannot open guest image: %s\n", guest_paths[i]);
+            fprintf(stderr, "Can't open guest image: %s\n", guest_paths[i]);
             cleanup_vm(&vms[i], mem);
             return -1;
         }
@@ -378,7 +377,7 @@ int main(int argc, char *argv[])
         while(!feof(img[i])) {
             size_t bytes_read = fread(mem_ptr, 1, 1024, img[i]);
             if (ferror(img[i])) {
-                perror("rrror reading guest binary");
+                perror("Error reading guest binary");
                 fclose(img[i]);
                 cleanup_vm(&vms[i], mem);
                 return -1;
