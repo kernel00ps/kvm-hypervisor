@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <linux/kvm.h>
+#include <pthread.h>
 
 #define MEM_BASE_MULTIPLIER 0x100000
 #define PAGE_SIZE_4KB 0x1000
@@ -193,12 +194,65 @@ static void setup_long_mode(struct vm *vm, struct kvm_sregs *sregs)
     setup_64bit_code_segment(sregs);
 }
 
+void* run_vm(void *arg)
+{
+    int ret = 0;
+    int stop = 0;
+    struct vm* vm = (struct vm*)arg;
+    
+    while(!stop) {
+        ret = ioctl(vm->vcpu_fd, KVM_RUN, 0);
+        if (ret == -1) {
+            printf("KVM_RUN failed\n");
+            cleanup_vm(vm, mem); // TODO &vm->vm
+            return NULL; // 1->NULL
+        }
+
+        switch (vm->kvm_run->exit_reason) {
+            case KVM_EXIT_IO:
+                // I/O out: print a single character
+                if (vm->kvm_run->io.direction == KVM_EXIT_IO_OUT && vm->kvm_run->io.port == IO_PORT\
+                    && vm->kvm_run->io.size == 1 && vm->kvm_run->io.count == 1) {
+                    char *data_ptr = (char*)vm->kvm_run;
+                    putchar(*(data_ptr + vm->kvm_run->io.data_offset));
+                }
+                // I/O in: send a single character from input
+                else if(vm->kvm_run->io.direction == KVM_EXIT_IO_IN && vm->kvm_run->io.port == IO_PORT\
+                    && vm->kvm_run->io.size == 1 && vm->kvm_run->io.count == 1) {
+                        char input_char = getchar();
+                        char* data_ptr = (char*)vm->kvm_run;
+                        *(data_ptr + vm->kvm_run->io.data_offset) = input_char;
+                }
+                continue;
+                
+            case KVM_EXIT_HLT:
+                printf("KVM_EXIT_HLT\n");
+                stop = 1;
+                break;
+            case KVM_EXIT_INTERNAL_ERROR:
+                printf("Internal error: suberror = 0x%x\n", vm->kvm_run->internal.suberror);
+                stop = 1;
+                break;
+            case KVM_EXIT_SHUTDOWN:
+                printf("Shutdown\n");
+                stop = 1;
+                break;
+            default:
+                printf("Exit reason: %d\n", vm->kvm_run->exit_reason);
+                break;
+        }
+    }
+    cleanup_vm(vm, mem); // TODO &vm->vm
+}
+
 int main(int argc, char *argv[])
 {
     int opt;
     int memory_arg = 0;
     int page_arg = 0;
-    char *guest_img_path = NULL;
+    char **guest_paths = NULL;
+    int max_guests  = 0;
+    int guests_parsed = 0;
 
     // define long options
     static struct option long_options[] = {
@@ -208,7 +262,7 @@ int main(int argc, char *argv[])
         {0, 0, 0, 0}
     };
 
-    // parse command line arguments
+    // parse command-line arguments
     while ((opt = getopt_long(argc, argv, "m:p:g:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'm':
@@ -218,135 +272,138 @@ int main(int argc, char *argv[])
                 page_arg = atoi(optarg);
                 break;
             case 'g':
-                guest_img_path = optarg;
+                // allocate/expand guest_paths array by 1
+                if (guests_parsed >= max_guests) {
+                    max_guests = (max_guests == 0 ? 1 : max_guests * 2);
+                    guest_paths = realloc(guest_paths, max_guests * sizeof(*guest_paths));
+                }
+                guest_paths[guests_parsed++] = strdup(optarg);
                 break;
             default:
-                fprintf(stderr, "Usage: %s --memory <4|2> --page <4|2> --guest <path>\n", argv[0]);
-                //exit(EXIT_FAILURE);
-                return 1;
+                fprintf(stderr, "Usage: %s --memory <4|2> --page <4|2> --guest <img1> ...\n", argv[0]);
+                return EXIT_FAILURE;
         }
     }
-    // check argument validity
-    if (memory_arg == 0 || (page_arg != 4 && page_arg != 2) || (memory_arg != 2 && memory_arg != 4 && memory_arg != 8) || guest_img_path == NULL) {
-        fprintf(stderr, "Usage: %s --memory <4|2> --page <4|2> --guest <path>\n", argv[0]);
-        //exit(EXIT_FAILURE);
-        return 1;
+    
+    int opt_end = optind; // first index of non-option args
+
+    // absorb any remaining argv[] entries as additional guest paths
+    for (int i = opt_end; i < argc; i++) {
+        if (guests_parsed >= max_guests) {
+            max_guests = (max_guests == 0 ? 1 : max_guests * 2);
+            guest_paths = realloc(guest_paths, max_guests * sizeof(*guest_paths));
+        }
+        guest_paths[guests_parsed++] = strdup(argv[i]);
     }
 
-    printf("hypervisor started: mem = %zu MB, page = %sKB\n",
-           (size_t)memory_arg, (page_arg == 4) ? "4" : "2048"); 
-              
-    struct vm vm;
-    struct kvm_sregs sregs;
-    struct kvm_regs regs;
-    int stop = 0;
-    int ret = 0;
-    FILE* img = NULL;
+    if (guests_parsed == 0) {
+        fprintf(stderr, "error: at least one --guest <path> is required\n");
+        return EXIT_FAILURE;
+    }
 
-    // file descriptors invalid until set
-    vm.kvm_fd = vm.vm_fd = vm.vcpu_fd = -1;
-
-    vm.mem = NULL;
+    int num_guests = guests_parsed;
+    
+    // check argument validity
+    if (memory_arg == 0 ||
+        (page_arg != 4 && page_arg != 2) ||
+        (memory_arg != 2 && memory_arg != 4) ||
+        num_guests < 1) {
+        fprintf(stderr, "Usage: %s --memory <4|2> --page <4|2> --guest <img1> ...\n", argv[0]);
+        return EXIT_FAILURE;
+    }
 
     // calculate mem and page size
     mem = memory_arg * MEM_BASE_MULTIPLIER;
     page_size = (page_arg == 4) ? PAGE_SIZE_4KB : PAGE_SIZE_2MB;
 
-    if (init_vm(&vm, mem)) {
-        printf("Failed to init the VM\n");
-        cleanup_vm(&vm, mem);
-        return -1;
-    }
+    printf("hypervisor started: mem = %zu MB, page = %sKB, guests = %d\n",
+           (size_t)memory_arg, (page_arg == 4) ? "4" : "2048", num_guests);
 
-    // get current special registers
-    if (ioctl(vm.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
-        perror("KVM_GET_SREGS");
-        cleanup_vm(&vm, mem);
-        return -1;
-    }
+    pthread_t threads[num_guests];
+	struct vm vms[num_guests];
+	struct kvm_sregs sregs[num_guests];
+	struct kvm_regs regs[num_guests];
+	int stop = 0; // TODO Move?
+	FILE* img[num_guests];
 
-    setup_long_mode(&vm, &sregs);
+    // initializing VMs and loading their guest images
+    for(int i = 0; i < num_guests; i++) 
+    {
+        // file descriptors invalid until set
+        vms[i].kvm_fd = vms[i].vm_fd = vms[i].vcpu_fd = -1;
 
-    if (ioctl(vm.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
-        perror("KVM_SET_SREGS");
-        cleanup_vm(&vm, mem);
-        return -1;
-    }
+        vms[i].mem = NULL;
 
-    // init general purpose regs
-    memset(&regs, 0, sizeof(regs));
-    // clear all FLAGS bits, except bit 1 which is always set
-    regs.rflags = 2;
-    regs.rip = 0;
-    regs.rsp = mem; // stack pointer at the top of guest memory
+        if (init_vm(&vms[i], mem)) {
+                printf("Failed to init the VM %d\n", i);
+                return -1;
+        }
 
-    if (ioctl(vm.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
-        perror("KVM_SET_REGS");
-        cleanup_vm(&vm, mem);
-        return -1;
-    }
-
-    img = fopen(guest_img_path, "r");
-    if (!img) {
-        printf("Can't open binary file\n");
-        cleanup_vm(&vm, mem);
-        return -1;
-    }
-
-    char *mem_ptr = vm.mem;
-    while(feof(img) == 0) {
-        size_t bytes_read = fread(mem_ptr, 1, 1024, img);
-        if (ferror(img)) {
-            perror("Error reading guest binary");
-            fclose(img);
-            cleanup_vm(&vm, mem);
+        if (ioctl(vms[i].vcpu_fd, KVM_GET_SREGS, &sregs[i]) < 0) {
+            perror("KVM_GET_SREGS");
+            cleanup_vm(&vms[i], mem);
             return -1;
         }
-        mem_ptr += bytes_read;
-    }
-    fclose(img);
 
-    while(!stop) {
-        ret = ioctl(vm.vcpu_fd, KVM_RUN, 0);
-        if (ret == -1) {
-            printf("KVM_RUN failed\n");
-            cleanup_vm(&vm, mem);
-            return 1;
+        setup_long_mode(&vms[i], &sregs[i]);
+
+        if (ioctl(vms[i].vcpu_fd, KVM_SET_SREGS, &sregs[i]) < 0) {
+            perror("KVM_SET_SREGS");
+            cleanup_vm(&vms[i], mem);
+            return -1;
         }
 
-        switch (vm.kvm_run->exit_reason) {
-            case KVM_EXIT_IO:
-                // I/O out: print a single character
-                if (vm.kvm_run->io.direction == KVM_EXIT_IO_OUT && vm.kvm_run->io.port == IO_PORT\
-                    && vm.kvm_run->io.size == 1 && vm.kvm_run->io.count == 1) {
-                    char *data_ptr = (char*)vm.kvm_run;
-                    putchar(*(data_ptr + vm.kvm_run->io.data_offset));
-                }
-                // I/O in: send a single character from input
-                else if(vm.kvm_run->io.direction == KVM_EXIT_IO_IN && vm.kvm_run->io.port == IO_PORT\
-                    && vm.kvm_run->io.size == 1 && vm.kvm_run->io.count == 1) {
-                        char input_char = getchar();
-                        char* data_ptr = (char*)vm.kvm_run;
-                        *(data_ptr + vm.kvm_run->io.data_offset) = input_char;
-                }
-                continue;
-                
-            case KVM_EXIT_HLT:
-                printf("KVM_EXIT_HLT\n");
-                stop = 1;
-                break;
-            case KVM_EXIT_INTERNAL_ERROR:
-                printf("Internal error: suberror = 0x%x\n", vm.kvm_run->internal.suberror);
-                stop = 1;
-                break;
-            case KVM_EXIT_SHUTDOWN:
-                printf("Shutdown\n");
-                stop = 1;
-                break;
-            default:
-                printf("Exit reason: %d\n", vm.kvm_run->exit_reason);
-                break;
+        // init general purpose regs
+        memset(&regs[i], 0, sizeof(regs[i]));
+        // clear all FLAGS bits, except bit 1 which is always set
+        regs[i].rflags = 2;
+        regs[i].rip = 0;
+        regs[i].rsp = mem; // stack pointer at the top of guest memory
+
+        if (ioctl(vms[i].vcpu_fd, KVM_SET_REGS, &regs[i]) < 0) {
+            perror("KVM_SET_REGS");
+            cleanup_vm(&vms[i], mem);
+            return -1;
+        }
+
+        // open guest img file
+        img[i] = fopen(guest_paths[i], "rb"); //TODO r vs rb
+        if (img[i] == NULL) {
+            fprintf(stderr, "cannot open guest image: %s\n", guest_paths[i]);
+            cleanup_vm(&vms[i], mem);
+            return -1;
+        }
+
+        char *mem_ptr = vms[i].mem;
+        while(!feof(img[i])) {
+            size_t bytes_read = fread(mem_ptr, 1, 1024, img[i]);
+            if (ferror(img[i])) {
+                perror("rrror reading guest binary");
+                fclose(img[i]);
+                cleanup_vm(&vms[i], mem);
+                return -1;
+            }
+            mem_ptr += bytes_read;
+        }
+  	    fclose(img[i]);
+
+        // create a thread to run this VM
+        if (pthread_create(&threads[i], NULL, run_vm, &vms[i]) != 0) {
+            perror("pthread_create");
+            cleanup_vm(&vms[i], mem);
+            return EXIT_FAILURE;
         }
     }
-    cleanup_vm(&vm, mem);
+	
+    // wait for all VMs to finish
+    for(int i = 0; i < num_guests; i++)
+        pthread_join(threads[i], NULL);
+
+    // free guest_paths[]
+    for (int i = 0; i < guests_parsed; i++)
+        free(guest_paths[i]);
+    free(guest_paths);
 }
+
+
+
