@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -10,579 +11,634 @@
 #include <stdint.h>
 #include <linux/kvm.h>
 #include <pthread.h>
-#include <string.h>
 #include <stdbool.h>
 
-#define MEM_BASE 0x100000
-int pg;
+#define MEM_BASE_MULTIPLIER 0x100000
+#define PAGE_SIZE_4KB       0x1000
+#define PAGE_SIZE_2MB       0x200000
+
+int page_size;
 int mem;
+
+// mem layout addresses for PT structures
+#define PML4_ADDR 0x1000
+#define PDPT_ADDR 0x2000
+#define PD_ADDR   0x3000
+#define PT_ADDR   0x4000
+
+// 64-bit page entry bits
 #define PDE64_PRESENT 1
-#define PDE64_RW (1U << 1)
-#define PDE64_USER (1U << 2)
-#define PDE64_PS (1U << 7)
+#define PDE64_RW      (1U << 1)
+#define PDE64_USER    (1U << 2)
+#define PDE64_PS      (1U << 7)
 
-// CR4
+// CR flags
 #define CR4_PAE (1U << 5)
+#define CR0_PE   1u
+#define CR0_PG   (1U << 31)
 
-// CR0
-#define CR0_PE 1u
-#define CR0_PG (1U << 31)
-
+// EFER flags
 #define EFER_LME (1U << 8)
 #define EFER_LMA (1U << 10)
 
-#define FILENAME_LEN 50
+// maximum number of simultaneous open files per VM
+#define MAX_HANDLES 32
 
-int global_vm_id = 0;
+#define FILENAME_MAX_LEN    64
+
+#define IO_PORT_KBD         0xE9
+#define IO_PORT_FILE        0x0278
 
 struct vm {
-	int kvm_fd;
-	int vm_fd;
-	int vcpu_fd;
-	char *mem;
-	struct kvm_run *kvm_run;
-    int id;
+    int kvm_fd;
+    int vm_fd;
+    int vcpu_fd;
+    char *mem;
+    struct kvm_run *kvm_run;
+    size_t kvm_run_mmap_size;
 };
 
-typedef struct List {
-    FILE* fd;
-    char* name;
-    struct List* next;
-    char op;
-    bool global;
-    int cur;
-} List;
+// file that can be shared or private to a VM
+typedef struct {
+    char name[FILENAME_MAX_LEN];
+    FILE *shared_fp; // open handle to the shared file (read or initial write cpy)
+} SharedFile;
 
-List* ListShared;
+// oopen file handle (inside VM)
+typedef struct {
+    bool in_use;
+    char name[FILENAME_MAX_LEN];
+    FILE* fp;
+    bool is_shared; // true if original shared file (read only)
+    bool is_private; // true if private copy (writeable)
+    long offset;     // current file offset
+} FileHandle;
 
-void add_node(List** head, char* filename)
+static SharedFile *shared_files = NULL;
+static int num_shared = 0;
+
+static void cleanup_vm(struct vm *vm, size_t mem_size) {
+    if (vm->kvm_run && vm->kvm_run != MAP_FAILED)
+        munmap(vm->kvm_run, vm->kvm_run_mmap_size);
+    if (vm->mem && vm->mem != MAP_FAILED)
+        munmap(vm->mem, mem_size);
+    if (vm->vcpu_fd >= 0)
+        close(vm->vcpu_fd);
+    if (vm->vm_fd >= 0)
+        close(vm->vm_fd);
+    if (vm->kvm_fd >= 0)
+        close(vm->kvm_fd);
+}
+
+int init_vm(struct vm *vm, size_t mem_size)
 {
-     List* node = (List*)malloc(sizeof(List));
-     node->fd=fopen(filename, "r");
-    node->name = filename;
-    node->global=true;
-    node->next = *head;
-    *head = node;
-}
+    struct kvm_userspace_memory_region region;
 
-bool is_in(List* head, char* filename) {
-    for(List* cur = head; cur; cur = cur->next) {
-        if(!strcmp(filename, cur->name))
-            return true;
+    // get file desc for KVM
+    vm->kvm_fd = open("/dev/kvm", O_RDWR);
+    if (vm->kvm_fd < 0) {
+        perror("open /dev/kvm");
+        return -1;
     }
-    return false;
-}
 
-List* find_in_open(List* head, char* filename) {
-    for(List* cur = head; cur; cur = cur->next) {
-        if(!strcmp(filename, cur->name))
-            return cur;
+    // get file desc for the VM
+    vm->vm_fd = ioctl(vm->kvm_fd, KVM_CREATE_VM, 0);
+    if (vm->vm_fd < 0) {
+        perror("KVM_CREATE_VM");
+        cleanup_vm(vm, mem_size);
+        return -1;
     }
-    return NULL;
-}
 
-void open_file(List* head, char* filename) {
-    List* node = (List*)malloc(sizeof(List));
-    node->name = filename;
-    node->fd = fopen(filename, "w");
-    node->next = head;
-    node->cur=0;
-    head = node;
-}
-
-void close_file(List* head, char* filename) {
-    List* prev = NULL;
-    for(List* cur = head; cur; cur = cur->next) {
-        if(!strcmp(filename, cur->name)) { //found it
-            prev = cur->next;
-            fclose(cur->fd);
-            free(cur);
-            break;
-        }
-        prev = cur;
+    // guest memory alloc
+    vm->mem = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (vm->mem == MAP_FAILED) {
+        perror("mmap mem");
+        cleanup_vm(vm, mem_size);
+        return -1;
     }
-}
 
-int init_vm(struct vm *vm, size_t mem_size) {
-
-    vm->id = global_vm_id++;
-
-	struct kvm_userspace_memory_region region;
-	int kvm_run_mmap_size;
-
-	vm->kvm_fd = open("/dev/kvm", O_RDWR);
-	if (vm->kvm_fd < 0) {
-		perror("open /dev/kvm");
-		return -1;
-	}
-
-	vm->vm_fd = ioctl(vm->kvm_fd, KVM_CREATE_VM, 0);
-	if (vm->vm_fd < 0) {
-		perror("KVM_CREATE_VM");
-		return -1;
-	}
-
-	vm->mem = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
-		   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (vm->mem == MAP_FAILED) {
-		perror("mmap mem");
-		return -1;
-	}
-
-	region.slot = 0;
-	region.flags = 0;
-	region.guest_phys_addr = 0;
-	region.memory_size = mem_size;
-	region.userspace_addr = (unsigned long)vm->mem;
+    region.slot = 0;
+    region.flags = 0;
+    region.guest_phys_addr = 0;
+    region.memory_size = mem_size;
+    region.userspace_addr = (unsigned long)vm->mem;
     if (ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-		perror("KVM_SET_USER_MEMORY_REGION");
+        perror("KVM_SET_USER_MEMORY_REGION");
+        cleanup_vm(vm, mem_size);
         return -1;
-	}
-
-	vm->vcpu_fd = ioctl(vm->vm_fd, KVM_CREATE_VCPU, 0);
-    if (vm->vcpu_fd < 0) {
-		perror("KVM_CREATE_VCPU");
-        return -1;
-	}
-
-	kvm_run_mmap_size = ioctl(vm->kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-    if (kvm_run_mmap_size <= 0) {
-		perror("KVM_GET_VCPU_MMAP_SIZE");
-		return -1;
-	}
-
-	vm->kvm_run = mmap(NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE,
-			     MAP_SHARED, vm->vcpu_fd, 0);
-	if (vm->kvm_run == MAP_FAILED) {
-		perror("mmap kvm_run");
-		return -1;
-	}
-
-	return 0;
-}
-
-int num_of_shared;
-
-static void setup_64bit_code_segment(struct kvm_sregs *sregs) {
-	struct kvm_segment seg = {
-		.base = 0,
-		.limit = 0xffffffff,
-		.present = 1, // Prisutan ili učitan u memoriji
-		.type = 11, // Code: execute, read, accessed
-		.dpl = 0, // Descriptor Privilage Level: 0 (0, 1, 2, 3)
-		.db = 0, // Default size - ima vrednost 0 u long modu
-		.s = 1, // Code/data tip segmenta
-		.l = 1, // Long mode - 1
-		.g = 1, // 4KB granularnost
-	};
-
-	sregs->cs = seg;
-
-	seg.type = 3; // Data: read, write, accessed
-	sregs->ds = sregs->es = sregs->fs = sregs->gs = sregs->ss = seg;
-}
-
-static void setup_long_mode(struct vm *vm, struct kvm_sregs *sregs) {
-
-	int pt_bru = mem/pg;
-
-	uint64_t page = 0;
-	uint64_t pml4_addr = 0x1000;
-	uint64_t *pml4 = (void *)(vm->mem + pml4_addr);
-
-	uint64_t pdpt_addr = 0x2000;
-	uint64_t *pdpt = (void *)(vm->mem + pdpt_addr);
-
-	uint64_t pd_addr = 0x3000;
-	uint64_t *pd = (void *)(vm->mem + pd_addr);
-
-	uint64_t pt_addr = 0x4000;
-	uint64_t *pt = (void *)(vm->mem + pt_addr);
-
-	pml4[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pdpt_addr;
-	pdpt[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pd_addr;
-
-	if(pg == 0x200000) {
-		for(int i = 0; i < mem/pg; i ++)
-			pd[i] = PDE64_PRESENT | PDE64_RW | PDE64_USER | PDE64_PS;
-	}
-	else {
-		for(int i = 0; i < 1.0 * mem / pg / 512; i++) {
-			pd[i] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pt_addr + i * 0x1000;
-	//		printf("pd[%d] - %d\n", i, pt_addr + i * 0x1000);
     }
-		
-		for(int i = 0; i < pt_bru; i++) {
-			pt[i] = page | PDE64_PRESENT | PDE64_RW | PDE64_USER;
-	//		printf("pt[%d] - %d\n", i, page);
-			page += pg;
-		}
-	}
 
-	sregs->cr3  = pml4_addr; 
-	sregs->cr4  = CR4_PAE; // "Physical Address Extension" mora biti 1 za long mode.
-	sregs->cr0  = CR0_PE | CR0_PG; // Postavljanje "Protected Mode" i "Paging" 
-	sregs->efer = EFER_LME | EFER_LMA; // Postavljanje  "Long Mode Active" i "Long Mode Enable"
+    // VCPU file desc
+    vm->vcpu_fd = ioctl(vm->vm_fd, KVM_CREATE_VCPU, 0);
+    if (vm->vcpu_fd < 0) {
+        perror("KVM_CREATE_VCPU");
+        cleanup_vm(vm, mem_size);
+        return -1;
+    }
 
-	setup_64bit_code_segment(sregs);
+    vm->kvm_run_mmap_size = ioctl(vm->kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+    if (vm->kvm_run_mmap_size <= 0) {
+        perror("KVM_GET_VCPU_MMAP_SIZE");
+        cleanup_vm(vm, mem_size);
+        return -1;
+    }
+
+    vm->kvm_run = mmap(NULL, vm->kvm_run_mmap_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, vm->vcpu_fd, 0);
+    if (vm->kvm_run == MAP_FAILED) {
+        perror("mmap kvm_run");
+        cleanup_vm(vm, mem_size);
+        return -1;
+    }
+
+    return 0;
 }
 
-void* run_vm(void *arg) {
+static void setup_64bit_code_segment(struct kvm_sregs *sregs)
+{
+    struct kvm_segment seg = {
+        .base    = 0,
+        .limit   = 0xffffffff,
+        .present = 1, // segment present in memory
+        .type = 11, // executable, readable, accessed
+        .dpl = 0, // descriptor privilege level: 0 (0, 1, 2, 3)
+        .db = 0, // default size 0 in long mode
+        .s = 1, // code/data segment
+        .l = 1, // 64-bit long mode enabled
+        .g = 1, // 4KB granularity
+    };
 
+    sregs->cs = seg;
+    seg.type = 3; // data segment: readable, writable, accessed
+    sregs->ds = sregs->es = sregs->fs = sregs->gs = sregs->ss = seg;
+}
+
+static void setup_long_mode(struct vm *vm, struct kvm_sregs *sregs)
+{
+    int pt_entries = mem / page_size;
+
+    uint64_t page = 0;
+
+    // pointers to page tables
+
+    uint64_t *pml4 = (uint64_t *)(vm->mem + PML4_ADDR);
+    uint64_t *pdpt = (uint64_t *)(vm->mem + PDPT_ADDR);
+    uint64_t *pd   = (uint64_t *)(vm->mem + PD_ADDR);
+    uint64_t *pt   = (uint64_t *)(vm->mem + PT_ADDR);
+
+    pml4[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | PDPT_ADDR;
+    pdpt[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | PD_ADDR;
+
+    // when using 2MB pages ---> PD is the last level
+    if (page_size == PAGE_SIZE_2MB) {
+        for (int i = 0; i < pt_entries; i++) {
+            pd[i] = page | PDE64_PRESENT | PDE64_RW | PDE64_USER | PDE64_PS;
+            page += page_size;
+        }
+    }
+    // when using 4KB pages ---> PT is the last level
+    else {
+        int pdpt_entries = (mem / page_size) / 512;
+        for (int i = 0; i < pdpt_entries; i++) {
+            pd[i] = PDE64_PRESENT | PDE64_RW | PDE64_USER | (PT_ADDR + i * PAGE_SIZE_4KB);
+        }
+        for (int i = 0; i < pt_entries; i++) {
+            pt[i] = page | PDE64_PRESENT | PDE64_RW | PDE64_USER;
+            page += page_size;
+        }
+    }
+
+    // long mode - ctrl registers
+    sregs->cr3  = PML4_ADDR; 
+    sregs->cr4  = CR4_PAE; // enabling "Physical Address Extension"
+    sregs->cr0  = CR0_PE | CR0_PG; // enabling "Protected Mode" and "Paging" 
+    sregs->efer = EFER_LME | EFER_LMA; // enabling  "Long Mode Active" and "Long Mode Enable"
+
+    // initialize segment registers
+    setup_64bit_code_segment(sregs);
+}
+
+// create private copy of a shared file for WR operations
+static FILE* make_private_copy(const char *shared_name, const char *vm_copy_name) {
+    FILE *src = fopen(shared_name, "rb");
+    if (!src)
+        return NULL;
+
+    FILE *dst = fopen(vm_copy_name, "wb");
+    if (!dst) {
+        fclose(src);
+        return NULL;
+    }
+    int ch;
+    while ((ch = fgetc(src)) != EOF) {
+        fputc(ch, dst);
+    }
+    fclose(src);
+    return dst;
+}
+
+// maintain array of handles inside each VM
+typedef struct {
+    FileHandle handles[MAX_HANDLES];
+} VMFileTable;
+
+// find free slot in VM’s file table
+static int allocate_handle(VMFileTable *table, const char *name, FILE *fp, bool is_shared, bool is_private) {
+    for (int i = 0; i < MAX_HANDLES; i++) {
+        if (!table->handles[i].in_use) {
+            table->handles[i].in_use     = true;
+            strncpy(table->handles[i].name, name, FILENAME_MAX_LEN - 1);
+            table->handles[i].name[FILENAME_MAX_LEN - 1] = '\0';
+            table->handles[i].fp          = fp;
+            table->handles[i].is_shared   = is_shared;
+            table->handles[i].is_private  = is_private;
+            table->handles[i].offset      = 0;
+            return i;
+        }
+    }
+    return -1; // no free handle
+}
+
+// look up open handle index by filename
+static int find_handle_index(VMFileTable *table, const char *name) {
+    for (int i = 0; i < MAX_HANDLES; i++) {
+        if (table->handles[i].in_use && strcmp(table->handles[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// close handle
+static void close_handle(VMFileTable *table, int idx) {
+    if (idx < 0 || idx >= MAX_HANDLES)
+        return;
+    if (table->handles[idx].in_use) {
+        fclose(table->handles[idx].fp);
+        table->handles[idx].in_use = false;
+    }
+}
+
+// check if filename is in the shared set
+static int find_shared_file(const char *name) {
+    for (int i = 0; i < num_shared; i++) {
+        if (strcmp(shared_files[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+void *run_vm(void *arg)
+{
     int ret = 0;
-    struct vm* vm = (struct vm*)arg;
-    struct List* ListOpen = NULL;
-    struct List* cur_file = NULL;
     int stop = 0;
-    int cnt = 0;
-    int cntorg=0;
-    bool started = false;
-    bool curRead = false;
-    bool curWrite = false;
-    bool got_filename = false;
-    bool command_fetched = false;
-    bool finished = false;
-    char op_code;
-    char filename[FILENAME_LEN] = "";
-    char original_name[FILENAME_LEN] = "";
-    //int tid = (int) gettid();
+    struct vm *vm = (struct vm *)arg;
+    VMFileTable  file_table = {0};
 
-    while(stop == 0) {
-		ret = ioctl(vm->vcpu_fd, KVM_RUN, 0);
-		if (ret == -1) {
-            printf("KVM_RUN failed\n");
+    while (!stop) {
+        ret = ioctl(vm->vcpu_fd, KVM_RUN, 0);
+        if (ret == -1) {
+            perror("KVM_RUN failed");
+            cleanup_vm(vm, mem);
             return NULL;
         }
 
-		switch (vm->kvm_run->exit_reason) {
-			case KVM_EXIT_IO:
-				if (vm->kvm_run->io.direction == KVM_EXIT_IO_OUT && vm->kvm_run->io.port == 0xE9\
-					&& vm->kvm_run->io.size == 1 && vm->kvm_run->io.count == 1) {
-					char *p = (char *)vm->kvm_run;
-					printf("%c", *(p + vm->kvm_run->io.data_offset));
-				}
-				else if(vm->kvm_run->io.direction == KVM_EXIT_IO_IN && vm->kvm_run->io.port == 0xE9\
-					&& vm->kvm_run->io.size == 1 && vm->kvm_run->io.count == 1) {
-						char input_char = getchar();
-						char* p = (char*)vm->kvm_run;
-						*(p + vm->kvm_run->io.data_offset) = input_char;
-				}
-                else if (vm->kvm_run->io.direction == KVM_EXIT_IO_OUT && vm->kvm_run->io.port == 0x0278\
-                    && vm->kvm_run->io.size == 1 && vm->kvm_run->io.count == 1) {
-					char* p = (char *)vm->kvm_run;
-                    char* input = p + vm->kvm_run->io.data_offset;
+        switch (vm->kvm_run->exit_reason) {
+            case KVM_EXIT_IO:
+                // KBD I/O from VM
+                if (vm->kvm_run->io.direction == KVM_EXIT_IO_OUT &&
+                    vm->kvm_run->io.port == IO_PORT_KBD &&
+                    vm->kvm_run->io.size == 1 &&
+                    vm->kvm_run->io.count == 1) {
+                    char *data_ptr = (char *)vm->kvm_run;
+                    putchar(*(data_ptr + vm->kvm_run->io.data_offset));
+                }
+                else if (vm->kvm_run->io.direction == KVM_EXIT_IO_IN &&
+                         vm->kvm_run->io.port == IO_PORT_KBD &&
+                         vm->kvm_run->io.size == 1 &&
+                         vm->kvm_run->io.count == 1) {
+                    char input_char = getchar();
+                    char *data_ptr = (char *)vm->kvm_run;
+                    *(data_ptr + vm->kvm_run->io.data_offset) = input_char;
+                }
+                // file I/O from VM
+                else if (vm->kvm_run->io.direction == KVM_EXIT_IO_OUT &&
+                         vm->kvm_run->io.port == IO_PORT_FILE &&
+                         vm->kvm_run->io.size == 1 &&
+                         vm->kvm_run->io.count == 1) {
+                    // protocol from guest: first byte = op code ('o','r','w','c'),
+                    // then bytes of filename (terminated by '|'), then if 'w', a data byte.
+                    static char op = 0;
+                    static char fname[FILENAME_MAX_LEN];
+                    static int  fn_idx = 0;
+                    char *p = (char *)vm->kvm_run;
+                    char  b = *(p + vm->kvm_run->io.data_offset);
 
-                    if(!started) {
-                        started = true;
-					    op_code = *input;
-                        printf("operation code: %c\n", op_code);
-                        original_name[0]='\0';
-                        cntorg=0;
-                        finished = false;
-                        got_filename = false;
-                        filename[0]='\0';
-                        cnt=0;
-
-                        for(int i; i<strlen(filename); i++) {
-                               if(filename[i]!='\0') cnt++;
-                               else break;
+                    if (op == 0) {
+                        // first byte: operation code
+                        op = b;
+                        fn_idx = 0;
+                        fname[0] = '\0';
+                    }
+                    else if (b != '|') {
+                        // building filename
+                        if (fn_idx < FILENAME_MAX_LEN - 1) {
+                            fname[fn_idx++] = b;
+                            fname[fn_idx] = '\0';
                         }
                     }
-                    else {  
-                        printf("input: %c\n", *input);
-                        // reading filename
-                        if(strcmp(input, " ") && strcmp(input, "|") && !got_filename)
-                        {
-                            filename[cnt++] = *input; 
-                            original_name[cntorg++]= *input; 
-                            printf("%s", original_name);
-                        }
-                        // selecting operation
-                        if(!strcmp(input, "|"))
-                        {
-                            got_filename = true;
-                            if(op_code=='r') curRead=true;
-                            else if(op_code=='w') curWrite=true;
-                        }
-                        else if(!strcmp(input, "/"))
-                        {
-                           started=false;
-                           filename[0]='\0';
-                        }
-                        else if(got_filename && !finished) {
-                        switch(op_code)
-                        {
-                         case 'o': //open
-                            if(!is_in(ListOpen, filename)){ 
-                                List* node = (List*)malloc(sizeof(List));
-                                node->name = filename;
-                                node->fd = fopen(filename, "w");
-                                node->next = ListOpen;
-                                node->cur=0;
-                                ListOpen = node;
-                                cur_file = ListOpen;}
-                                break;        
-                        
-                         case 'w': 
-                            if(is_in(ListOpen, filename))
-                            {
-                                cur_file=find_in_open(ListOpen, filename);
-                                if(cur_file!=NULL) 
-                                {
-                                    fseek(cur_file->fd, cur_file->cur, 0);
-                                    if(cur_file->fd==NULL)
-                                    fputc(*input, cur_file->fd);
-                                    cur_file->cur++;
+                    else {
+                        // '|' delimiter: perform operation now
+                        int handle_idx = find_handle_index(&file_table, fname);
+                        switch (op) {
+                            case 'o': {
+                                if (handle_idx != -1) {
+                                    // already open, ignore
+                                    break;
                                 }
+                                // check if filename is in shared set
+                                int sidx = find_shared_file(fname);
+                                FILE *fp = NULL;
+                                if (sidx >= 0) {
+                                    // shared file: open for RD
+                                    fp = fopen(shared_files[sidx].name, "rb");
+                                    if (!fp) {
+                                        // if not exist create empty
+                                        fp = fopen(shared_files[sidx].name, "wb+");
+                                        fseek(fp, 0, SEEK_SET);
+                                    }
+                                    allocate_handle(&file_table, fname, fp, true, false);
+                                }
+                                else {
+                                    // private file: create new
+                                    fp = fopen(fname, "wb+");
+                                    allocate_handle(&file_table, fname, fp, false, true);
+                                }
+                                break;
                             }
-                            else if(is_in(ListOpen, original_name))
-                            {
-                                List* node = (List*)malloc(sizeof(List));
-                                node->name = filename;
-                                List* shared = find_in_open(ListShared, original_name);
-                                node->fd = fopen(filename, "w");
-                                char offset;
-                                do {
-                                    fputc(offset,node->fd);
-                                } while ((offset=fgetc(shared->fd))!= EOF);
-                                node->next = ListOpen;
-                                node->cur=0;
-                                ListOpen = node;
-                                cur_file = ListOpen;
-                                fseek(cur_file->fd, cur_file->cur, 0);
-                                fputc(*input, cur_file->fd);
-                                cur_file->cur++;
+                            case 'r': {
+                                if (handle_idx < 0) break;
+                                FileHandle *h = &file_table.handles[handle_idx];
+                                fseek(h->fp, h->offset, SEEK_SET);
+                                int ch = fgetc(h->fp);
+                                if (ch == EOF) ch = 0; 
+                                h->offset++;
+                                // return read byte back to guest
+                                char *q = (char *)vm->kvm_run;
+                                *(q + vm->kvm_run->io.data_offset) = (char)ch;
+                                break;
                             }
-                            else if(is_in(ListShared, original_name))  
-                            {
-                                List* node = (List*)malloc(sizeof(List));
-                                node->name = filename;
-                                List* shared = find_in_open(ListShared, original_name);
-                                node->fd = fopen(filename, "w");
-                                char offset;
-                                node->cur=0;
-                                while ((offset=fgetc(shared->fd))!=EOF)
-                                {
-                                    fputc(offset, node->fd);
-                                    node->cur=node->cur+1;
-                                } 
-                                node->cur=node->cur-1;
-                                node->next = ListOpen;
-                               //node->cur=0;
-                                ListOpen = node;
-                                cur_file = ListOpen;
-                                fseek(cur_file->fd, cur_file->cur, 0);
-                                    fputc(*input, cur_file->fd);
-                                    cur_file->cur++;
-                            }            
-                            else if(!is_in(ListOpen, filename))
-                            {
-                                List* node = (List*)malloc(sizeof(List));
-                                node->name = filename;
-                                node->fd = fopen(filename, "w");
-                                node->next = ListOpen;
-                                node->cur=0;
-                                ListOpen = node;
-                                cur_file = ListOpen;
-                                fseek(cur_file->fd, cur_file->cur, 0);
-                                fputc(*input, cur_file->fd);
-                                cur_file->cur++;
+                            case 'w': {
+                                // next byte after '|' is data to write
+                                // will be read on the next IN I/O from guest
+                                break;
                             }
- 
-                         break;
-
-                        case 'c': //close
-                            close_file(ListOpen, filename);
-                        break;
-                    }
-                    }
-                    }             
-                    
-				}
-				else if(vm->kvm_run->io.direction == KVM_EXIT_IO_IN && vm->kvm_run->io.port == 0x0278\
-					&& vm->kvm_run->io.size == 1 && vm->kvm_run->io.count == 1) {
-                        if(op_code=='r')
-                        {   if(is_in(ListOpen, original_name))
-                              {
-                                cur_file=find_in_open(ListOpen, original_name);
-                                fseek(cur_file->fd, cur_file->cur, 0);
-                                char file_char =  fgetc(cur_file->fd);
-                                if(file_char==EOF)
-                                  {
-                                     cur_file->cur=-1;
-                                     started=false;
-                                     filename[0]='\0';
-                                  }
-                                cur_file->cur++;
-						        char* p = (char*)vm->kvm_run;
-						        *(p + vm->kvm_run->io.data_offset) = file_char;
-                              }
-                            else if(is_in(ListOpen, filename))
-                            {
-                                cur_file=find_in_open(ListOpen, filename);
-                                fseek(cur_file->fd, cur_file->cur, 0);
-                                char file_char =  fgetc(cur_file->fd);
-                                if(file_char==EOF)
-                                  {
-                                     cur_file->cur=-1;
-                                     started=false;
-                                     filename[0]='\0';
-                                  }
-                                cur_file->cur++;
-						        char* p = (char*)vm->kvm_run;
-						        *(p + vm->kvm_run->io.data_offset) = file_char;
-                              }
-                            else if(is_in(ListShared, original_name))  
-                            {
-                                List* node = (List*)malloc(sizeof(List));
-                                node->name = original_name;
-                                List* shared = find_in_open(ListShared, original_name);
-                                node->fd = shared->fd;
-                                node->next = ListOpen;
-                                node->cur=0;
-                                ListOpen = node;
-                                cur_file = ListOpen;
-                                fseek(cur_file->fd, cur_file->cur, 0);
-                                char file_char = fgetc(cur_file->fd);
-                                if(file_char==EOF)
-                                  {
-                                     cur_file->cur=-1;
-                                     started=false;
-                                     filename[0]='\0';
-                                  }
-                                cur_file->cur++;
-						        char* p = (char*)vm->kvm_run;
-						        *(p + vm->kvm_run->io.data_offset) = file_char;
-                            }            
-                            else if(!is_in(ListOpen, filename))
-                            {
-                                List* node = (List*)malloc(sizeof(List));
-                                node->name = filename;
-                                node->fd = fopen(filename, "w");
-                                node->next = ListOpen;
-                                node->cur=0;
-                                ListOpen = node;
-                                cur_file = ListOpen;
-                                fseek(cur_file->fd, cur_file->cur, 0);
-                                char file_char =  fgetc(cur_file->fd);
-                                if(file_char==EOF)
-                                  {
-                                     cur_file->cur=-1;
-                                     started=false;
-                                     filename[0]='\0';
-                                  }
-                                cur_file->cur++;
-						        char* p = (char*)vm->kvm_run;
-						        *(p + vm->kvm_run->io.data_offset) = file_char;
+                            case 'c': {
+                                if (handle_idx >= 0) {
+                                    close_handle(&file_table, handle_idx);
+                                }
+                                break;
                             }
+                            default:
+                                break;
                         }
-				}
-				continue;
-				
-			case KVM_EXIT_HLT:
-				printf("KVM_EXIT_HLT\n");
-				stop = 1;
-				break;
-			case KVM_EXIT_INTERNAL_ERROR:
-				printf("Internal error: suberror = 0x%x\n", vm->kvm_run->internal.suberror);
-				stop = 1;
-				break;
-			case KVM_EXIT_SHUTDOWN:
-				printf("Shutdown\n");
-				stop = 1;
-				break;
-			default:
-				printf("Exit reason: %d\n", vm->kvm_run->exit_reason);
-				break;
-    	}
-  	}
+                        op = 0; // reset for next command
+                    }
+                }
+                else if (vm->kvm_run->io.direction == KVM_EXIT_IO_IN &&
+                         vm->kvm_run->io.port == IO_PORT_FILE &&
+                         vm->kvm_run->io.size == 1 &&
+                         vm->kvm_run->io.count == 1) {
+                    // for WR operation: guest expects a status or just an ACK
+                    // will return 0 success.
+                    char *p = (char *)vm->kvm_run;
+                    *(p + vm->kvm_run->io.data_offset) = (char)0;
+                }
+                continue;
+
+            case KVM_EXIT_HLT:
+                stop = 1;
+                break;
+            case KVM_EXIT_INTERNAL_ERROR:
+                fprintf(stderr, "Internal error: suberror = 0x%x\n",
+                        vm->kvm_run->internal.suberror);
+                stop = 1;
+                break;
+            case KVM_EXIT_SHUTDOWN:
+                stop = 1;
+                break;
+            default:
+                stop = 1;
+                break;
+        }
+    }
+
+    // close any remaining open handles
+    for (int i = 0; i < MAX_HANDLES; i++) {
+        if (file_table.handles[i].in_use) {
+            fclose(file_table.handles[i].fp);
+        }
+    }
+    cleanup_vm(vm, mem);
+    return NULL;
 }
 
 int main(int argc, char *argv[])
 {
-    int guests = 0;
-    int shared = 0;
+    int opt;
+    int memory_arg = 0;
+    int page_arg = 0;
+    char **guest_paths = NULL;
+    int max_guests = 0;
+    int guests_parsed = 0;
 
-    for(int i = 6; i < argc; i ++) {
-        printf("argv: %s\n", argv[i]);
-        if(!(strcmp(argv[i], "-f") && strcmp(argv[i], "--file")))
-            break;
-        guests++;
-    }
-    shared = argc - guests - 7;
-    printf("shared: %d, guests: %d\n", shared, guests);
+    char **shared_paths = NULL;
+    int max_shared = 0;
+    int shared_parsed = 0;
 
-    if(guests == 0) {
-        printf("no guests provided\n");
-        return -1;
-    }
+    // define long options
+    static struct option long_options[] = {
+        {"memory", required_argument, 0, 'm'},
+        {"page",   required_argument, 0, 'p'},
+        {"guest",  required_argument, 0, 'g'},
+        {"file",   required_argument, 0, 'f'},
+        {0, 0, 0, 0}
+    };
 
-    pthread_t threads[guests];
-	struct vm vms[guests];
-	struct kvm_sregs sregs[guests];
-	struct kvm_regs regs[guests];
-	int stop = 0;
-    num_of_shared = shared;
-	FILE* img[guests];
-    char* shared_names[shared];
-  //  List* node;
-    for(int i = 0; i < shared; i++)
-        add_node(&ListShared, argv[7 + guests + i]);
-
-	if (argc < 7) {
-    	//printf("The program requests an image to run: %s <guest-image>\n", argv[0]);
-		printf("broj argumenata nije ok!\n");
-    	return 1;
-  	}
-
-	mem = atoi(argv[2]) * MEM_BASE;
-	pg = atoi(argv[4]);
-	pg = (pg == 4) ? 0x1000 : 0x200000;
-
-    for(int i = 0; i < guests; i++) {
-
-        if (init_vm(&vms[i], mem)) {
-                printf("Failed to init the VM\n");
-                return -1;
+    // parse command-line arguments
+    while ((opt = getopt_long(argc, argv, "m:p:g:f:", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'm':
+                memory_arg = atoi(optarg);
+                break;
+            case 'p':
+                page_arg = atoi(optarg);
+                break;
+            case 'g':
+                // allocate/expand guest_paths array by 1
+                if (guests_parsed >= max_guests) {
+                    max_guests = (max_guests == 0 ? 1 : max_guests * 2);
+                    guest_paths = realloc(guest_paths, max_guests * sizeof(*guest_paths));
+                }
+                guest_paths[guests_parsed++] = strdup(optarg);
+                break;
+            case 'f':
+                if (shared_parsed >= max_shared) {
+                    max_shared = (max_shared == 0 ? 1 : max_shared * 2);
+                    shared_paths = realloc(shared_paths, max_shared * sizeof(*shared_paths));
+                }
+                shared_paths[shared_parsed++] = strdup(optarg);
+                break;
+            default:
+                fprintf(stderr, "Usage: %s --memory <8|4|2> --page <4|2> --guest <img1> [--guest <img2> ...] [--file <shared1> ...]\n", argv[0]);
+                return EXIT_FAILURE;
         }
+    }
+
+    int opt_end = optind; // first index of non-option args
+
+    // absorb any leftover guest args as guests
+    for (int i = opt_end; i < argc; i++) {
+        if (guests_parsed >= max_guests) {
+            max_guests = (max_guests == 0 ? 1 : max_guests * 2);
+            guest_paths = realloc(guest_paths, max_guests * sizeof(*guest_paths));
+        }
+        guest_paths[guests_parsed++] = strdup(argv[i]);
+    }
+
+    if (guests_parsed == 0) {
+        fprintf(stderr, "Error: at least one --guest <path> is required\n");
+        return EXIT_FAILURE;
+    }
+
+    // load shared files into memory
+    num_shared = shared_parsed;
+    shared_files = calloc(num_shared, sizeof(*shared_files));
+    for (int i = 0; i < shared_parsed; i++) {
+        strncpy(shared_files[i].name, shared_paths[i], FILENAME_MAX_LEN - 1);
+        shared_files[i].name[FILENAME_MAX_LEN - 1] = '\0';
+        // open for read (create an empty file if missing)
+        shared_files[i].shared_fp = fopen(shared_files[i].name, "rb");
+        if (!shared_files[i].shared_fp) {
+            shared_files[i].shared_fp = fopen(shared_files[i].name, "wb+");
+        }
+        rewind(shared_files[i].shared_fp);
+    }
+
+    int num_guests = guests_parsed;
+
+    // check argument validity
+    if (memory_arg == 0 ||
+        (page_arg != 4 && page_arg != 2) ||
+        (memory_arg != 2 && memory_arg != 4 && memory_arg != 8) ||
+        num_guests < 1) {
+        fprintf(stderr, "Usage: %s --memory <8|4|2> --page <4|2> --guest <img1> ... [--file <shared1> ...]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    // calculate mem and page size
+    mem = memory_arg * MEM_BASE_MULTIPLIER;
+    page_size = (page_arg == 4) ? PAGE_SIZE_4KB : PAGE_SIZE_2MB;
+
+    printf("Hypervisor started: mem = %zuMB, page = %sKB, guests = %d, shared_files = %d\n",
+           (size_t)memory_arg, (page_arg == 4) ? "4" : "2048", num_guests, num_shared);
+
+    pthread_t threads[num_guests];
+    struct vm vms[num_guests];
+    struct kvm_sregs sregs[num_guests];
+    struct kvm_regs regs[num_guests];
+    FILE *img[num_guests];
+
+    // initializing VMs and loading their guest images
+    for (int i = 0; i < num_guests; i++) {
+
+        // file descriptors invalid until set
+        vms[i].kvm_fd = vms[i].vm_fd = vms[i].vcpu_fd = -1;
+        
+        vms[i].mem = NULL;
+
+        if (init_vm(&vms[i], mem) != 0) {
+            fprintf(stderr, "Failed to init VM %d\n", i);
+            return EXIT_FAILURE;
+        }
+
         if (ioctl(vms[i].vcpu_fd, KVM_GET_SREGS, &sregs[i]) < 0) {
             perror("KVM_GET_SREGS");
-            return -1;
+            cleanup_vm(&vms[i], mem);
+            return EXIT_FAILURE;
         }
+
         setup_long_mode(&vms[i], &sregs[i]);
 
         if (ioctl(vms[i].vcpu_fd, KVM_SET_SREGS, &sregs[i]) < 0) {
             perror("KVM_SET_SREGS");
-            return -1;
+            cleanup_vm(&vms[i], mem);
+            return EXIT_FAILURE;
         }
-        memset(&regs[i], 0, sizeof(regs));
+
+        // init general purpose regs
+        memset(&regs[i], 0, sizeof(regs[i]));
+        // clear all FLAGS bits, except bit 1 which is always set
         regs[i].rflags = 2;
         regs[i].rip = 0;
-        regs[i].rsp = mem;
+        regs[i].rsp = mem; // stack pointer at the top of guest memory
 
         if (ioctl(vms[i].vcpu_fd, KVM_SET_REGS, &regs[i]) < 0) {
             perror("KVM_SET_REGS");
-            return -1;
+            cleanup_vm(&vms[i], mem);
+            return EXIT_FAILURE;
         }
 
-        img[i] = fopen(argv[6 + i], "r");
-        if (img[i] == NULL) {
-            printf("Can not open binary file\n");
-            return -1;
+        // open guest img file
+        img[i] = fopen(guest_paths[i], "rb");
+        if (!img[i]) {
+            fprintf(stderr, "Can't open guest image: %s\n", guest_paths[i]);
+            cleanup_vm(&vms[i], mem);
+            return EXIT_FAILURE;
         }
 
-        char *p = vms[i].mem;
-        while(feof(img[i]) == 0) {
-            int r = fread(p, 1, 1024, *(img + i));
-            p += r;
+        char *mem_ptr = vms[i].mem;
+        while (!feof(img[i])) {
+            size_t bytes_read = fread(mem_ptr, 1, 1024, img[i]);
+            if (ferror(img[i])) {
+                perror("Error reading guest binary");
+                fclose(img[i]);
+                cleanup_vm(&vms[i], mem);
+                return EXIT_FAILURE;
+            }
+            mem_ptr += bytes_read;
         }
-  	    fclose(img[i]);
+        fclose(img[i]);
+
+        // create a thread to run this VM
+        if (pthread_create(&threads[i], NULL, run_vm, &vms[i]) != 0) {
+            perror("pthread_create");
+            cleanup_vm(&vms[i], mem);
+            return EXIT_FAILURE;
+        }
     }
 
-    for(int i = 0; i < guests; i++) 
-        pthread_create(&threads[i], NULL, run_vm, &vms[i]);
-	
-    for(int i = 0; i < guests; i++)
+    // wait for all VMs to finish
+    for (int i = 0; i < num_guests; i++) {
         pthread_join(threads[i], NULL);
+    }
+
+    // cleanup shared file handles
+    for (int i = 0; i < num_shared; i++) {
+        if (shared_files[i].shared_fp) {
+            fclose(shared_files[i].shared_fp);
+        }
+    }
+    free(shared_files);
+
+    for (int i = 0; i < guests_parsed; i++) {
+        free(guest_paths[i]);
+    }
+    free(guest_paths);
+
+    for (int i = 0; i < shared_parsed; i++) {
+        free(shared_paths[i]);
+    }
+    free(shared_paths);
 
 }
