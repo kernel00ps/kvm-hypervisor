@@ -2,3 +2,4 @@
 *.o
 *.img
 *.vscode
+Version_C/*.txt
